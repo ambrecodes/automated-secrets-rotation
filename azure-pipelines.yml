@@ -1,0 +1,148 @@
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: secret-rotation-vars
+  - name: ROTATION_THRESHOLD_DAYS
+    value: 800
+  - name: AWS_REGION
+    value: 'eu-west-1'
+  - name: AWS_SECRET_ARN
+    value: 'arn:aws:secretsmanager:eu-west-1:042631866300:secret:test/secretrotation-mlVXAj'
+
+steps:
+  # Step 1: Install Azure CLI extension for Graph
+  - task: AzureCLI@2
+    inputs:
+      azureSubscription: 'test'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        # Install Microsoft Graph CLI extension
+        az extension add --name msgraph-cli --upgrade -y
+        echo "Extension installed"
+    displayName: 'Install Azure CLI Extensions'
+
+  # Step 2: Get access token for Microsoft Graph
+  - task: AzureCLI@2
+    inputs:
+      azureSubscription: 'test'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
+        echo "##vso[task.setvariable variable=GRAPH_TOKEN;issecret=true]$TOKEN"
+        echo "Token acquired successfully"
+    displayName: 'Get Microsoft Graph Token'
+
+  # Step 3: Get current secret metadata
+  - script: |
+      curl -s -X GET \
+        "https://graph.microsoft.com/v1.0/applications/$(AZURE_OBJECT_ID)" \
+        -H "Authorization: Bearer $(GRAPH_TOKEN)" > app_data.json
+      
+      echo "Application data retrieved"
+      cat app_data.json | head -c 500
+    displayName: 'Get Current Secret Expiry'
+
+  # Step 4: Extract expiry and calculate days remaining
+  - script: |
+      EXPIRY=$(cat app_data.json | jq -r '.passwordCredentials[0].endDateTime' 2>/dev/null || echo "")
+      
+      if [ -z "$EXPIRY" ]; then
+        echo "Could not extract expiry from response"
+        DAYS_REMAINING=1000
+      else
+        echo "Secret expiry: $EXPIRY"
+        EXPIRY_EPOCH=$(date -d "$EXPIRY" +%s 2>/dev/null || date +%s)
+        NOW_EPOCH=$(date +%s)
+        DAYS_REMAINING=$(( ($EXPIRY_EPOCH - $NOW_EPOCH) / 86400 ))
+      fi
+      
+      echo "Days remaining: $DAYS_REMAINING"
+      echo "Threshold: $(ROTATION_THRESHOLD_DAYS)"
+      
+      if [ $DAYS_REMAINING -le $(ROTATION_THRESHOLD_DAYS) ]; then
+        echo "##vso[task.setvariable variable=SHOULD_ROTATE]true"
+        echo "✓ Rotation needed"
+      else
+        echo "##vso[task.setvariable variable=SHOULD_ROTATE]false"
+        echo "✓ No rotation needed"
+      fi
+    displayName: 'Evaluate Rotation Condition'
+
+  # Step 5: Generate new secret in Azure
+  - script: |
+      if [ "$(SHOULD_ROTATE)" = "true" ]; then
+        NEW_SECRET_DISPLAY="rotation-$(Build.BuildId)"
+        EXPIRY_DATE=$(date -u -d "+6 months" +"%Y-%m-%dT%H:%M:%SZ")
+        
+        echo "Generating new secret with expiry: $EXPIRY_DATE"
+        
+        RESPONSE=$(curl -s -X POST \
+          "https://graph.microsoft.com/v1.0/applications/$(AZURE_OBJECT_ID)/addPassword" \
+          -H "Authorization: Bearer $(GRAPH_TOKEN)" \
+          -H "Content-Type: application/json" \
+          -d "{\"displayName\":\"$NEW_SECRET_DISPLAY\",\"endDateTime\":\"$EXPIRY_DATE\"}")
+        
+        echo "API Response:"
+        echo "$RESPONSE" | jq '.' 2>/dev/null || echo "$RESPONSE"
+        
+        NEW_SECRET=$(echo "$RESPONSE" | jq -r '.secretText' 2>/dev/null)
+        
+        if [ -z "$NEW_SECRET" ] || [ "$NEW_SECRET" = "null" ]; then
+          echo "##[error] Failed to extract secret from response"
+          exit 1
+        fi
+        
+        echo "##vso[task.setvariable variable=NEW_SECRET;issecret=true]$NEW_SECRET"
+        echo "✓ New secret generated"
+      else
+        echo "Skipping secret generation"
+      fi
+    displayName: 'Generate New Secret in Azure'
+    condition: eq(variables['SHOULD_ROTATE'], 'true')
+
+  # Step 6: Update AWS Secrets Manager
+  - script: |
+      if [ "$(SHOULD_ROTATE)" = "true" ] && [ ! -z "$(NEW_SECRET)" ]; then
+        aws secretsmanager put-secret-value \
+          --secret-id $(AWS_SECRET_ARN) \
+          --secret-string "{\"Secret\":\"$(NEW_SECRET)\"}"
+          --region $(AWS_REGION)
+        
+        echo "✓ Secret updated in AWS"
+      fi
+    displayName: 'Update AWS Secrets Manager'
+    env:
+      AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+      AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+    condition: eq(variables['SHOULD_ROTATE'], 'true')
+
+  # Step 7: Verify AWS update
+  - script: |
+      if [ "$(SHOULD_ROTATE)" = "true" ]; then
+        VERSION_ID=$(aws secretsmanager describe-secret \
+          --secret-id $(AWS_SECRET_ARN) \
+          --region $(AWS_REGION) \
+          --query 'VersionIdsToStages.keys()[0]' \
+          --output text)
+        
+        echo "✓ AWS update verified - Version: $VERSION_ID"
+      fi
+    displayName: 'Verify AWS Update'
+    env:
+      AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+      AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+    condition: eq(variables['SHOULD_ROTATE'], 'true')
+
+  # Step 8: Summary
+  - script: |
+      echo "=========================================="
+      echo "Pipeline completed"
+      echo "Build ID: $(Build.BuildId)"
+      echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "=========================================="
+    displayName: 'Rotation Summary'
